@@ -54,6 +54,8 @@ gradient_accumulation_steps: 1
 dataloader_num_workers: 10
 dataloader_pin_memory: true
 dataloader_persistent_workers: true
+robotwin_bucket_batching: false
+robotwin_bucket_min_chunks: 2
 optim: adamw_torch
 learning_rate: 1e-4
 adam_beta1: 0.95
@@ -69,6 +71,7 @@ save_strategy: steps
 save_steps: 500
 eval_strategy: "no"  # there has to be a double quote; otherwise a bare `no` will be interpreted as False
 save_total_limit: 8
+save_only_model: false
 report_to: wandb
 seed: 42
 do_eval: false
@@ -118,6 +121,7 @@ training_args:
   save_strategy: ${save_strategy}
   save_steps: ${save_steps}
   save_total_limit: ${save_total_limit}
+  save_only_model: ${save_only_model}
   report_to: ${report_to}
   seed: ${seed}
   do_eval: ${do_eval}

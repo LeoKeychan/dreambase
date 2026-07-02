@@ -65,6 +65,7 @@ VALID_EMBODIMENT_TAGS = [
     "dream", "yam", "xdof",
     "gr1_unified_segmentation", "language_table_sim", "gr1_isaac",
     "sim_behavior_r1_pro", "mecka_hands", "real_r1_pro_sharpa",
+    "maniparena_preliminary_joint", "maniparena_preliminary_ee", "maniparena_final_mobile_ee", "maniparena_final_tabletop_joint",
 ]
 
 

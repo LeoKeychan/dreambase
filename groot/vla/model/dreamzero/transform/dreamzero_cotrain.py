@@ -24,6 +24,57 @@ from groot.vla.data.transform.base import InvertibleModalityTransform
 from groot.vla.model.dreamzero.transform.common import formalize_language
 
 
+_DEBUG_COUNTERS: dict[str, int] = {}
+
+
+def _debug_supervision_enabled() -> bool:
+    # 训练排查开关；默认关闭，避免正常训练时打印大量样本信息。
+    return os.environ.get("DREAMZERO_DEBUG_SUPERVISION", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_rank_enabled() -> bool:
+    # 多卡训练只在 local rank 0 打印，减少重复日志。
+    return os.environ.get("LOCAL_RANK", "0") in {"", "0"}
+
+
+def _debug_limit() -> int:
+    try:
+        return int(os.environ.get("DREAMZERO_DEBUG_SUPERVISION_LIMIT", "3"))
+    except ValueError:
+        return 3
+
+
+def _should_debug_print(section: str) -> bool:
+    # 每个 section 单独限流，默认只看前几个样本即可判断链路是否异常。
+    if not (_debug_supervision_enabled() and _debug_rank_enabled()):
+        return False
+    count = _DEBUG_COUNTERS.get(section, 0)
+    if count >= _debug_limit():
+        return False
+    _DEBUG_COUNTERS[section] = count + 1
+    return True
+
+
+def _summarize_array(name: str, value: Any, max_values: int = 8) -> str:
+    # 用紧凑摘要检查 shape、dtype、值域和少量样例值，不打印完整大数组。
+    if value is None:
+        return f"{name}: None"
+    if torch.is_tensor(value):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+    if array.dtype.kind in {"U", "S", "O"}:
+        return f"{name}: shape={array.shape}, dtype={array.dtype}, value={repr(value)[:240]}"
+    flat = array.reshape(-1)
+    preview = np.array2string(flat[:max_values], precision=4, separator=", ")
+    if flat.size == 0:
+        return f"{name}: shape={array.shape}, dtype={array.dtype}, empty"
+    return (
+        f"{name}: shape={array.shape}, dtype={array.dtype}, "
+        f"min={float(np.nanmin(flat)):.4f}, max={float(np.nanmax(flat)):.4f}, first={preview}"
+    )
+
+
 def basic_clean(text):
     text = ftfy.fix_text(text)
     text = html.unescape(html.unescape(text))
@@ -92,12 +143,49 @@ class HuggingfaceTokenizer:
 def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
     batch = {}
     keys = features[0].keys()
+    if embodiment_tag_mapping is None:
+        raise ValueError("embodiment_tag_mapping must be provided for DreamZero collation.")
+
+    def is_embodiment(elem: dict, embodiment_tag: EmbodimentTag) -> bool:
+        embodiment_name = embodiment_tag.value
+        if embodiment_name not in embodiment_tag_mapping:
+            return False
+        return elem["embodiment_id"] == embodiment_tag_mapping[embodiment_name]
+
+    def format_maniparena_instruction(instruction: str) -> str:
+        instruction = str(instruction).lower()
+        return (
+            "A multi-view video shows that a robot "
+            + instruction
+            + " The video is split into four views: "
+            + "The top-left view shows the camera view from the robot's head, "
+            + "the top-right view shows the camera view from the right hand, "
+            + "the bottom-left view shows the camera view from the left hand, "
+            + "and the bottom-right view is a black screen (inactive view). "
+            + "The robot "
+            + instruction
+        )
+
+    def format_robotwin_instruction(instruction: str) -> str:
+        instruction = str(instruction).lower()
+        return (
+            "A multi-view video shows that a robot "
+            + instruction
+            + " The video is split into four views: "
+            + "The top-left view shows the camera view from the robot's head, "
+            + "the top-right view shows the right camera view, "
+            + "the bottom-left view shows the left camera view, "
+            + "and the bottom-right view is a black screen (inactive view). "
+            + "The robot "
+            + instruction
+        )
 
     for key in keys:
         if key == "text":
             output_values = []
             for elem in features:
                 item = elem[key]
+                # 兼容 "['task text']"、"'task text'" 这种被字符串包起来的结构化文本
                 try:
                     parsed_item = ast.literal_eval(item)
                     # Handle different return types from ast.literal_eval
@@ -107,45 +195,66 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         # If it's already a scalar (string, float, int, etc.), convert to string
                         processed_item = str(parsed_item)
                     
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                    if num_views > 1 and is_embodiment(elem, EmbodimentTag.AGIBOT):
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+                    elif is_embodiment(elem, EmbodimentTag.OXE_DROID):
                         processed_item = (
                             "A multi-view video shows that a robot "
                             + processed_item.lower()
                             + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
                             + processed_item.lower()
                         )
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+                    elif is_embodiment(elem, EmbodimentTag.GR1_UNIFIED):
                         processed_item = "A single view video shows that a human " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+                    elif is_embodiment(elem, EmbodimentTag.MECKA_HANDS):
                         processed_item = "A single view video shows that a human " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+                    elif is_embodiment(elem, EmbodimentTag.XDOF):
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
+                    elif is_embodiment(elem, EmbodimentTag.YAM):
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_PRELIMINARY_JOINT):
+                        processed_item = format_maniparena_instruction(processed_item)
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_PRELIMINARY_EE):
+                        processed_item = format_maniparena_instruction(processed_item)
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_FINAL_MOBILE_EE):
+                        processed_item = format_maniparena_instruction(processed_item)
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_FINAL_TABLETOP_JOINT):
+                        processed_item = format_maniparena_instruction(processed_item)
+                    elif is_embodiment(elem, EmbodimentTag.ROBOTWIN_CROSSVIEW_JOINT):
+                        processed_item = format_robotwin_instruction(processed_item)
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
                     output_values.append(processed_item)  
+                # 兼容 "task text" 这种普通文本
                 except (ValueError, SyntaxError, TypeError):
                     # If parsing fails or item is already a string, use it directly
-                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                    if num_views > 1 and is_embodiment(elem, EmbodimentTag.AGIBOT):
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+                    elif is_embodiment(elem, EmbodimentTag.OXE_DROID):
                         item = (
                             "A multi-view video shows that a robot "
                             + str(item).lower()
                             + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
                             + str(item).lower()
                         )
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+                    elif is_embodiment(elem, EmbodimentTag.GR1_UNIFIED):
                         item = "A single view video shows that a human " + str(item).lower() 
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+                    elif is_embodiment(elem, EmbodimentTag.MECKA_HANDS):
                         item = "A single view video shows that a human " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+                    elif is_embodiment(elem, EmbodimentTag.XDOF):
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
-                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
-                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
+                    elif is_embodiment(elem, EmbodimentTag.YAM):
+                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_PRELIMINARY_JOINT):
+                        item = format_maniparena_instruction(item)
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_PRELIMINARY_EE):
+                        item = format_maniparena_instruction(item)
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_FINAL_MOBILE_EE):
+                        item = format_maniparena_instruction(item)
+                    elif is_embodiment(elem, EmbodimentTag.MANIPARENA_FINAL_TABLETOP_JOINT):
+                        item = format_maniparena_instruction(item)
+                    elif is_embodiment(elem, EmbodimentTag.ROBOTWIN_CROSSVIEW_JOINT):
+                        item = format_robotwin_instruction(item)
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
                     output_values.append(item)
@@ -153,6 +262,13 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
             ids, mask = tokenizer(output_values, return_mask=True, add_special_tokens=True)
             batch[key] = ids 
             batch['text_attention_mask'] = mask
+            if _should_debug_print("collate"):
+                # Collate-level 检查：确认最终送入 tokenizer 的 prompt 是否和训练预期一致。
+                print("[DreamZeroDebug][collate]")
+                print(f"  batch_size={len(features)}, first_embodiment_id={features[0].get('embodiment_id')}")
+                print(f"  first_prompt={output_values[0]!r}")
+                print(_summarize_array("  token_ids", ids))
+                print(_summarize_array("  text_attention_mask", mask))
         elif key == "text_negative":
             values = [elem[key] for elem in features]
             ids, mask = tokenizer(values, return_mask=True, add_special_tokens=True)
@@ -357,6 +473,17 @@ class DreamTransform(InvertibleModalityTransform):
             # For other embodiments: use 2x2 grid layout
             # Layout: [head, right]
             #         [left, black]
+
+            if self.embodiment_tag == EmbodimentTag.ROBOTWIN_CROSSVIEW_JOINT and v >= 4:
+                concat_images = np.zeros((1, t, c, 2 * h, 2 * w), dtype=images.dtype)
+                # RoboTwin order from the converted dataset:
+                # [input_head | input_front]
+                # [input_left | input_right]
+                concat_images[0, :, :, :h, :w] = images[0]
+                concat_images[0, :, :, :h, w:] = images[1]
+                concat_images[0, :, :, h:, :w] = images[2]
+                concat_images[0, :, :, h:, w:] = images[3]
+                return concat_images
             
             # Create output tensor with doubled height and width
             concat_images = np.zeros((1, t, c, 2*h, 2*w), dtype=images.dtype)
@@ -599,6 +726,21 @@ class DreamTransform(InvertibleModalityTransform):
                 for key in action_and_mask_keys
             ), f"Shape mismatch: {[(key, transformed_data[key].shape) for key in action_and_mask_keys]}"
 
+        if _should_debug_print("transform"):
+            # Transform-level 检查：确认 resize/归一化/补 padding 前后的 state/action/video 是否合理。
+            print("[DreamZeroDebug][transform.apply_single]")
+            print(f"  training={self.training}, embodiment_tag={self.embodiment_tag.value}")
+            print(f"  raw_language={repr(data.get(self._language_key, self.default_instruction))[:240]}")
+            print(f"  language_before_collate={repr(language)[:240]}")
+            print(_summarize_array("  input.video", data.get("video")))
+            print(_summarize_array("  input.state", data.get("state")))
+            print(_summarize_array("  input.action", data.get("action")))
+            print(_summarize_array("  output.images", transformed_data.get("images")))
+            print(_summarize_array("  output.state", transformed_data.get("state")))
+            print(_summarize_array("  output.state_mask", transformed_data.get("state_mask")))
+            print(_summarize_array("  output.action", transformed_data.get("action")))
+            print(_summarize_array("  output.action_mask", transformed_data.get("action_mask")))
+
         return transformed_data
 
     def apply_batch(self, data: dict, batch_size: int) -> dict:
@@ -627,4 +769,3 @@ class DreamTransform(InvertibleModalityTransform):
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)
-

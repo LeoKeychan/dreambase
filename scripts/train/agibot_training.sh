@@ -55,7 +55,7 @@ if [ ! -d "$AGIBOT_DATA_ROOT" ]; then
 fi
 
 torchrun --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experiment.py \
-    report_to=wandb \
+    report_to=None \
     data=dreamzero/agibot_relative \
     wandb_project=dreamzero \
     train_architecture=lora \

@@ -346,3 +346,19 @@ class EmbodimentTag(Enum):
     """
     The Mecka robot with hands.
     """
+
+    MANIPARENA_PRELIMINARY_JOINT = "maniparena_preliminary_joint"
+
+    MANIPARENA_PRELIMINARY_EE = "maniparena_preliminary_ee"
+
+    MANIPARENA_FINAL_MOBILE_EE = "maniparena_final_mobile_ee"
+
+    MANIPARENA_FINAL_TABLETOP_JOINT = "maniparena_final_tabletop_joint"
+    """
+    The Maniparena dataset.
+    """
+
+    ROBOTWIN_CROSSVIEW_JOINT = "robotwin_crossview_joint"
+    """
+    RoboTwin adjust-bottle dataset with joint action supervision.
+    """

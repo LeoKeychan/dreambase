@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Tuple
+import os
+import json
 
 from hydra.utils import instantiate
 import numpy as np
@@ -16,6 +18,52 @@ ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
 N_COLOR_CHANNELS = 3
+
+
+def _load_safetensors_dir(pretrained_model_name_or_path: str) -> dict:
+    from safetensors.torch import load_file
+
+    safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+    safetensors_index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
+
+    state_dict = {}
+    if os.path.exists(safetensors_index_path):
+        print(f"Loading sharded safetensors using index: {safetensors_index_path}")
+        with open(safetensors_index_path, "r") as f:
+            index = json.load(f)
+        for shard_file in sorted(set(index["weight_map"].values())):
+            shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
+            print(f"Loading shard: {shard_path}")
+            state_dict.update(load_file(shard_path))
+    elif os.path.exists(safetensors_path):
+        print(f"Loading weights from safetensors: {safetensors_path}")
+        state_dict.update(load_file(safetensors_path))
+    else:
+        raise FileNotFoundError(
+            f"No valid checkpoint found at {pretrained_model_name_or_path}. "
+            "Expected model.safetensors or model.safetensors.index.json."
+        )
+    return state_dict
+
+
+def _resolve_pretrained_model_path_from_exp_cfg(checkpoint_path: str) -> str | None:
+    conf_path = os.path.join(checkpoint_path, "experiment_cfg", "conf.yaml")
+    if not os.path.exists(conf_path):
+        return None
+    try:
+        from omegaconf import OmegaConf
+
+        cfg = OmegaConf.load(conf_path)
+        pretrained_model_path = cfg.get("pretrained_model_path", None)
+    except Exception as exc:
+        print(f"Warning: failed to read pretrained_model_path from {conf_path}: {exc}")
+        return None
+
+    if not pretrained_model_path:
+        return None
+    if not os.path.isabs(pretrained_model_path):
+        pretrained_model_path = os.path.abspath(pretrained_model_path)
+    return pretrained_model_path
 
 
 @dataclass
@@ -55,6 +103,7 @@ class VLA(PreTrainedModel):
         self,
         config: VLAConfig,
     ):
+        print(f"[CODE_CHECK] VLA.__init__ from {__file__}", flush=True)
         assert isinstance(config.backbone_cfg, dict)
         assert isinstance(config.action_head_cfg, dict)
         super().__init__(config)
@@ -323,13 +372,23 @@ class VLA(PreTrainedModel):
                 "Expected 'model.safetensors' or 'model.safetensors.index.json'."
             )
 
+        def maybe_inject_lora_after_loading(reason: str):
+            if (
+                hasattr(model, "action_head")
+                and hasattr(model.action_head, "inject_lora_after_loading")
+                and model.action_head.config.defer_lora_injection
+            ):
+                print(f"Injecting LoRA adapters into action_head {reason}")
+                model.action_head.inject_lora_after_loading()
+
         if lora_weights_path is not None:
+            # 修复点 2：defer_lora_injection=True 时，LoRA adapter 不会在 __init__ 创建。
+            # 因此必须先注入 adapter，再加载 lora_A/lora_B 权重，否则 LoRA 权重会被当作 unexpected keys 丢掉。
+            maybe_inject_lora_after_loading("before loading LoRA weights")
             print(f"Loading LoRA weights from: {lora_weights_path}")
             model.load_lora_weight(lora_weights_path)
         else:
-            if hasattr(model, 'action_head') and hasattr(model.action_head, 'inject_lora_after_loading') and model.action_head.config.defer_lora_injection:
-                print("Injecting LoRA adapters into action_head after loading pretrained weights")
-                model.action_head.inject_lora_after_loading()
+            maybe_inject_lora_after_loading("after loading pretrained weights")
         
         print(f"{cls}\n")
         return model
@@ -339,34 +398,9 @@ class VLA(PreTrainedModel):
         cls, 
         pretrained_model_name_or_path: str
     ): 
-        from safetensors.torch import load_file
-        import os
-        import json
         print("loading lora@@@@@")
 
-        # Check for different checkpoint formats
-        safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
-        safetensors_index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
-        
-        state_dict = {}
-        if os.path.exists(safetensors_index_path):
-            # Handle sharded safetensors
-            print(f"Loading sharded safetensors using index: {safetensors_index_path}")
-            
-            with open(safetensors_index_path, 'r') as f:
-                index = json.load(f)
-            
-            # Load each shard
-            for shard_file in set(index["weight_map"].values()):
-                shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
-                print(f"Loading shard: {shard_path}")
-                shard_state_dict = load_file(shard_path)
-                state_dict.update(shard_state_dict)
-                
-        elif os.path.exists(safetensors_path):
-            # Handle single safetensors file
-            print(f"Loading weights from safetensors: {safetensors_path}")
-            state_dict.update(load_file(safetensors_path))
+        lora_state_dict = _load_safetensors_dir(pretrained_model_name_or_path)
         
         # Load config
         print("loading config@@")
@@ -376,22 +410,53 @@ class VLA(PreTrainedModel):
         config = VLAConfig(**config_dict)
         print("loading model")
 
-        # Disable defer_lora_injection so LoRA layers are created during init,
-        # matching the PEFT key hierarchy (base_model.model.*) in the checkpoint.
+        pretrained_model_path = _resolve_pretrained_model_path_from_exp_cfg(pretrained_model_name_or_path)
+
+        # 修复点 1：LoRA-only checkpoint 本身不包含完整 base。
+        # 如果 experiment_cfg 记录了 pretrained_model_path，需要复现训练链路：
+        # 先跳过 raw Wan DiT 组件加载，加载完整 pretrained base，再注入并加载 LoRA。
         ah_cfg = config.action_head_cfg
         inner = ah_cfg.get('config', ah_cfg) if isinstance(ah_cfg.get('config'), dict) else ah_cfg
-        if 'defer_lora_injection' in inner:
-            inner['defer_lora_injection'] = False
-            print("defer_lora_injection disabled for load_lora")
-        # Enable component loading so DiT base weights are loaded from pretrained
-        if 'skip_component_loading' in inner:
-            inner['skip_component_loading'] = False
-            print("skip_component_loading disabled for load_lora")
+        if pretrained_model_path is not None:
+            if 'defer_lora_injection' in inner:
+                inner['defer_lora_injection'] = True
+                print("defer_lora_injection enabled for pretrained base loading")
+            if 'skip_component_loading' in inner:
+                inner['skip_component_loading'] = True
+                print("skip_component_loading enabled for pretrained base loading")
+        else:
+            # Backward-compatible path for LoRA checkpoints that do not record a
+            # full pretrained base: create LoRA layers during init and load raw
+            # Wan components as before.
+            if 'defer_lora_injection' in inner:
+                inner['defer_lora_injection'] = False
+                print("defer_lora_injection disabled for load_lora")
+            if 'skip_component_loading' in inner:
+                inner['skip_component_loading'] = False
+                print("skip_component_loading disabled for load_lora")
 
-        # Instantiate model (LoRA layers now exist from init)
+        # Instantiate model.
         model = cls(config)
 
+        if pretrained_model_path is not None:
+            # 先加载训练时使用的 full pretrained base，例如 DreamZero-AgiBot。
+            # 之后再创建 LoRA adapter 并加载当前 LoRA checkpoint，避免退化成 raw Wan base + LoRA。
+            print(f"Loading pretrained base weights before LoRA: {pretrained_model_path}")
+            pretrained_state_dict = _load_safetensors_dir(pretrained_model_path)
+            missing_keys, unexpected_keys = model.load_state_dict(pretrained_state_dict, strict=False)
+            if missing_keys:
+                print(f"Missing keys when loading pretrained base weights: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected keys when loading pretrained base weights: {unexpected_keys}")
+            print("Successfully loaded pretrained base weights")
+
+            if (hasattr(model, 'action_head')
+                    and hasattr(model.action_head, 'inject_lora_after_loading')
+                    and model.action_head.config.defer_lora_injection):
+                model.action_head.inject_lora_after_loading()
+
         # Remove .base_layer from keys if present
+        state_dict = lora_state_dict
         has_base_layer = any(".base_layer." in key for key in state_dict.keys())
         if has_base_layer:
             print("Removing '.base_layer' from state dict keys")
@@ -401,11 +466,11 @@ class VLA(PreTrainedModel):
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
             
         if missing_keys:
-            print(f"Missing keys when loading pretrained weights: {missing_keys}")
+            print(f"Missing keys when loading LoRA weights: {missing_keys}")
         if unexpected_keys:
-            print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
+            print(f"Unexpected keys when loading LoRA weights: {unexpected_keys}")
         
-        print("Successfully loaded pretrained weights")
+        print("Successfully loaded LoRA weights")
 
         print(f"{cls}\n")
         return model

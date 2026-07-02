@@ -1,0 +1,67 @@
+# @package _global_
+
+defaults:
+  - dreamzero/base_48_wan_fine_aug_relative
+  - _self_
+
+max_state_dim: 64
+max_action_dim: 32
+use_global_metadata: false
+
+relative_action: true
+relative_action_per_horizon: false
+relative_action_keys:
+  - joint_action
+
+max_chunk_size: 5
+dataset_shard_sampling_rate: 1.0
+mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
+single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+
+robotwin_depth_root: /meta_eon_cfs/home/lqc/dataset/robotwin_depth
+robotwin_output_name: dreamzero_robotwin_crossview
+robotwin_data_root: /meta_eon_cfs/home/lqc/dataset/robotwin_adjust_bottle/dreamzero_robotwin_crossview
+robotwin_data_roots:
+  - ${robotwin_depth_root}/beat_block_hammer/${robotwin_output_name}
+  - ${robotwin_depth_root}/click_alarmclock/${robotwin_output_name}
+  - ${robotwin_depth_root}/dump_bin_bigbin/${robotwin_output_name}
+  - ${robotwin_depth_root}/grab_roller/${robotwin_output_name}
+  - ${robotwin_depth_root}/handover_block/${robotwin_output_name}
+  - ${robotwin_depth_root}/hanging_mug/${robotwin_output_name}
+  - ${robotwin_depth_root}/lift_pot/${robotwin_output_name}
+  - ${robotwin_depth_root}/move_can_pot/${robotwin_output_name}
+  - ${robotwin_depth_root}/move_playingcard_away/${robotwin_output_name}
+  - ${robotwin_depth_root}/open_laptop/${robotwin_output_name}
+  - ${robotwin_depth_root}/open_microwave/${robotwin_output_name}
+  - ${robotwin_depth_root}/pick_diverse_bottles/${robotwin_output_name}
+  - ${robotwin_depth_root}/pick_dual_bottles/${robotwin_output_name}
+  - ${robotwin_depth_root}/shake_bottle/${robotwin_output_name}
+  - ${robotwin_depth_root}/place_can_basket/${robotwin_output_name}
+  - ${robotwin_depth_root}/place_object_stand/${robotwin_output_name}
+
+train_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        robotwin_crossview_joint: ${robotwin_data_roots}
+      dataset_weight: 1.0
+      distribute_weights: false
+
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}

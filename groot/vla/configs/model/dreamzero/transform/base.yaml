@@ -40,3 +40,8 @@ embodiment_tag_to_projector_index:
   sim_behavior_r1_pro: 31
   mecka_hands: 27
   real_r1_pro_sharpa: 28
+  maniparena_preliminary_joint: 33
+  maniparena_preliminary_ee: 34
+  maniparena_final_mobile_ee: 35
+  maniparena_final_tabletop_joint: 36
+  robotwin_crossview_joint: 37

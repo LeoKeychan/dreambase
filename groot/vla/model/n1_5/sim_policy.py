@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,6 +18,61 @@ import time
 
 from groot.vla.data.schema import DatasetMetadata, EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
+
+
+_DEBUG_COUNTERS: dict[str, int] = {}
+
+
+def _debug_inference_enabled() -> bool:
+    return os.environ.get("DREAMZERO_DEBUG_INFERENCE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_rank_enabled() -> bool:
+    return os.environ.get("LOCAL_RANK", "0") in {"", "0"}
+
+
+def _debug_limit() -> int:
+    try:
+        return int(os.environ.get("DREAMZERO_DEBUG_SUPERVISION_LIMIT", "3"))
+    except ValueError:
+        return 3
+
+
+def _should_debug_print(section: str) -> bool:
+    if not (_debug_inference_enabled() and _debug_rank_enabled()):
+        return False
+    count = _DEBUG_COUNTERS.get(section, 0)
+    if count >= _debug_limit():
+        return False
+    _DEBUG_COUNTERS[section] = count + 1
+    return True
+
+
+def _summarize_array(name: str, value, max_values: int = 8) -> str:
+    if value is None:
+        return f"{name}: None"
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    array = np.asarray(value)
+    flat = array.reshape(-1)
+    if flat.size == 0:
+        return f"{name}: shape={array.shape}, dtype={array.dtype}, empty"
+    preview = flat[:max_values]
+    return (
+        f"{name}: shape={array.shape}, dtype={array.dtype}, "
+        f"min={float(np.nanmin(flat)):.6f}, max={float(np.nanmax(flat)):.6f}, "
+        f"first={preview}"
+    )
+
+
+def _summarize_step_delta(name: str, value) -> str:
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    array = np.asarray(value)
+    if array.shape[-2] < 2:
+        return f"{name}: skipped (horizon < 2, shape={array.shape})"
+    delta = np.diff(array, axis=-2)
+    return _summarize_array(name, delta)
 
 
 class ModelManager:
@@ -365,8 +421,9 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         metadata = DatasetMetadata.model_validate(metadatas[self.embodiment_tag.value])
 
         # If the model's action head has target_video_height/width (e.g. DreamZero Wan 5B), use that
-        # as the expected video resolution so the transform matches the model. metadata.json can
-        # otherwise contain a different resolution (e.g. 180x320) from dataset config.
+        # as the expected target video resolution so the transform matches the model. Do not apply
+        # this blindly to cross-view source videos: RoboTwin conditions on 320x176 source views while
+        # the action head can internally resize/supervise at 640x352.
         if hasattr(self.trained_model, "action_head") and hasattr(
             self.trained_model.action_head, "config"
         ):
@@ -374,8 +431,13 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             target_h = getattr(cfg, "target_video_height", None)
             target_w = getattr(cfg, "target_video_width", None)
             if target_h is not None and target_w is not None and metadata.modalities.video:
-                for key in metadata.modalities.video.keys():
-                    metadata.modalities.video[key].resolution = (int(target_w), int(target_h))
+                target_resolution = (int(target_w), int(target_h))
+                if self.embodiment_tag == EmbodimentTag.ROBOTWIN_CROSSVIEW_JOINT:
+                    if "target_front" in metadata.modalities.video:
+                        metadata.modalities.video["target_front"].resolution = target_resolution
+                else:
+                    for key in metadata.modalities.video.keys():
+                        metadata.modalities.video[key].resolution = target_resolution
 
         # 2.2. Get the eval transforms
         assert (
@@ -536,9 +598,23 @@ class GrootSimPolicy(BaseGrootSimPolicy):
 
     def unapply(self, batch: Batch, obs: dict = None, **kwargs):
         """Unnormalize actions and convert relative actions to absolute if needed"""
+        debug_unapply = _should_debug_print("sim_policy.unapply")
+        normalized_action_np = batch.normalized_action.detach().float().cpu().numpy()
+        if debug_unapply:
+            print("[DreamZeroDebug][sim_policy.unapply]")
+            print(_summarize_array("  normalized_action_all", normalized_action_np))
+            print(_summarize_array("  normalized_action_active14", normalized_action_np[..., :14]))
+            if normalized_action_np.shape[-1] > 14:
+                print(_summarize_array("  normalized_action_padded", normalized_action_np[..., 14:]))
+
         unnormalized_action = self.eval_transform.unapply(
             dict(action=batch.normalized_action.cpu())
         )
+        if debug_unapply:
+            print("  after eval_transform.unapply (relative deltas before adding state when configured):")
+            for dbg_key, dbg_value in unnormalized_action.items():
+                print(_summarize_array(f"  {dbg_key}", dbg_value))
+                print(_summarize_step_delta(f"  {dbg_key}.step_delta", dbg_value))
         
         # Check if relative_action is enabled and convert relative to absolute
         relative_action = self.train_cfg.get('relative_action', False)
@@ -601,7 +677,22 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                 
                 # Add state to relative action to get absolute action
                 print("last_state", last_state.shape, "unnormalized_action[action_key]", unnormalized_action[action_key].shape)
-                unnormalized_action[action_key] = unnormalized_action[action_key] + last_state
+                relative_delta = unnormalized_action[action_key]
+                absolute_action = relative_delta + last_state
+                if debug_unapply:
+                    print(f"  relative->absolute key={action_key}")
+                    print(_summarize_array("    last_state", last_state))
+                    print(_summarize_array("    relative_delta", relative_delta))
+                    print(_summarize_step_delta("    relative_delta.step_delta", relative_delta))
+                    print(_summarize_array("    absolute_action", absolute_action))
+                    print(_summarize_step_delta("    absolute_action.step_delta", absolute_action))
+                unnormalized_action[action_key] = absolute_action
+        
+        if debug_unapply:
+            print("  final action dict:")
+            for dbg_key, dbg_value in unnormalized_action.items():
+                print(_summarize_array(f"  {dbg_key}", dbg_value))
+                print(_summarize_step_delta(f"  {dbg_key}.step_delta", dbg_value))
         
         batch.act = unnormalized_action
         return batch

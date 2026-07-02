@@ -23,6 +23,108 @@ logger = logging.getLogger(__name__)
 WAN_HF_REPO_ID = "Wan-AI/Wan2.1-I2V-14B-480P"
 WAN22_HF_REPO_ID = "Wan-AI/Wan2.2-TI2V-5B"
 
+_DEBUG_COUNTERS: dict[str, int] = {}
+
+
+def _debug_supervision_enabled() -> bool:
+    # 与 dataset/transform 共用同一个 debug 开关，默认不影响正常训练。
+    return os.environ.get("DREAMZERO_DEBUG_SUPERVISION", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_inference_enabled() -> bool:
+    # 推理去噪 debug 单独开关；线上评测默认关闭，避免影响时延和日志量。
+    return os.environ.get("DREAMZERO_DEBUG_INFERENCE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_kv_cache_enabled() -> bool:
+    return os.environ.get("DREAMZERO_DEBUG_KV_CACHE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_rank_enabled() -> bool:
+    # 多卡训练只打印 local rank 0，避免每张卡重复输出同类信息。
+    return os.environ.get("LOCAL_RANK", "0") in {"", "0"}
+
+
+def _debug_limit() -> int:
+    try:
+        return int(os.environ.get("DREAMZERO_DEBUG_SUPERVISION_LIMIT", "3"))
+    except ValueError:
+        return 3
+
+
+def _debug_inference_step_limit() -> int:
+    try:
+        return int(os.environ.get("DREAMZERO_DEBUG_INFERENCE_STEPS", "16"))
+    except ValueError:
+        return 16
+
+
+def _should_debug_print(section: str) -> bool:
+    # 每个 section 独立限流；通常前几个 batch 足够确认监督标签是否异常。
+    if not (_debug_supervision_enabled() and _debug_rank_enabled()):
+        return False
+    count = _DEBUG_COUNTERS.get(section, 0)
+    if count >= _debug_limit():
+        return False
+    _DEBUG_COUNTERS[section] = count + 1
+    return True
+
+
+def _should_debug_inference_print(section: str) -> bool:
+    if not (_debug_inference_enabled() and _debug_rank_enabled()):
+        return False
+    count = _DEBUG_COUNTERS.get(section, 0)
+    if count >= _debug_limit():
+        return False
+    _DEBUG_COUNTERS[section] = count + 1
+    return True
+
+
+def _should_debug_kv_cache_print() -> bool:
+    return _debug_kv_cache_enabled() and _debug_rank_enabled()
+
+
+def _summarize_tensor(name: str, value: torch.Tensor | None, max_values: int = 8) -> str:
+    # Action head 中张量通常很大，只输出摘要以检查 shape、值域和前几个元素。
+    if value is None:
+        return f"{name}: None"
+    if not torch.is_tensor(value):
+        return f"{name}: type={type(value).__name__}, value={repr(value)[:240]}"
+    tensor = value.detach()
+    flat = tensor.reshape(-1)
+    flat_float = flat.float()
+    preview = flat_float[:max_values].cpu().numpy()
+    if flat.numel() == 0:
+        return f"{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, empty"
+    return (
+        f"{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}, "
+        f"min={float(flat_float.min().item()):.4f}, "
+        f"max={float(flat_float.max().item()):.4f}, "
+        f"first={preview}"
+    )
+
+
+def _infer_active_action_dim(action_input, action_pred: torch.Tensor) -> int:
+    action_mask = getattr(action_input, "action_mask", None)
+    if torch.is_tensor(action_mask) and action_mask.ndim >= 3 and action_mask.shape[-1] == action_pred.shape[-1]:
+        active_dims = torch.nonzero(action_mask[0].any(dim=0), as_tuple=False).flatten()
+        if active_dims.numel() > 0:
+            return int(active_dims.max().item()) + 1
+
+    state_mask = getattr(action_input, "state_mask", None)
+    if torch.is_tensor(state_mask) and state_mask.ndim >= 3:
+        active_dims = torch.nonzero(state_mask[0].any(dim=0), as_tuple=False).flatten()
+        if active_dims.numel() > 0:
+            return min(int(active_dims.max().item()) + 1, action_pred.shape[-1])
+
+    return action_pred.shape[-1]
+
+
+def _kv_cache_token_len(kv_caches: list) -> int:
+    if not kv_caches or not kv_caches[0]:
+        return 0
+    return int(kv_caches[0][0].shape[1])
+
 
 def hf_download(filename: str, repo_id: str = WAN_HF_REPO_ID) -> str:
     """Download a file from the specified HuggingFace repo to HF cache."""
@@ -48,6 +150,7 @@ from groot.vla.model.dreamzero.modules.flow_match_scheduler import FlowMatchSche
 from groot.vla.model.dreamzero.modules.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 from groot.vla.model.dreamzero.modules.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import FlowUniPCMultistepScheduler
+from groot.vla.model.dreamzero.action_head.source_cache_policy import _should_reset_for_local_attention
 
 
 KVCacheType: TypeAlias = torch.Tensor
@@ -121,6 +224,10 @@ class WANPolicyHeadConfig(PretrainedConfig):
     video_inference_final_noise: float = field(
         default=0.8, metadata={"help": "Final noise level for video during decoupled inference (0.0-1.0). E.g., 0.8 means video ends at 80% noise."}
     )
+    persistent_source_cache: bool = field(
+        default=False,
+        metadata={"help": "Keep source KV cache across local-attention windows during inference. Default preserves DreamBase 4-chunk reset."},
+    )
     num_timestep_buckets: int = field(
         default=1000, metadata={"help": "Number of timestep discretization buckets."}
     )
@@ -169,6 +276,7 @@ class WANPolicyHead(ActionHead):
         self.tile_stride_height = config.tile_stride_height
         self.tile_stride_width = config.tile_stride_width
         self.num_frame_per_block = config.num_frame_per_block
+        self.persistent_source_cache = bool(getattr(config, "persistent_source_cache", False))
         self.hidden_size = config.hidden_size
         self.num_frames = config.num_frames
         self.text_encoder = instantiate(config.text_encoder_cfg)
@@ -207,6 +315,7 @@ class WANPolicyHead(ActionHead):
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
 
 
+        # 16 步去噪
         num_dit_steps = 8
         if os.getenv("NUM_DIT_STEPS") is not None:
             num_dit_steps = int(os.getenv("NUM_DIT_STEPS"))
@@ -221,6 +330,31 @@ class WANPolicyHead(ActionHead):
         else:
             self.dit_step_mask = [True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True]
         assert self.dit_step_mask[0] == True, "first step must be True"
+
+        # 32 步去噪
+        # num_dit_steps = int(os.getenv("NUM_DIT_STEPS", str(self.num_inference_steps)))
+
+        # if num_dit_steps >= self.num_inference_steps:
+        #     self.dit_step_mask = [True] * self.num_inference_steps
+        # elif self.num_inference_steps == 16:
+        #     if num_dit_steps == 5:
+        #         self.dit_step_mask = [True, True, True, False, False, False, False, True, False, False, False, False, True, False, False, False]
+        #     elif num_dit_steps == 6:
+        #         self.dit_step_mask = [True, True, False, False, False, True, False, False, False, False, True, False, False, False, True, True]
+        #     elif num_dit_steps == 7:
+        #         self.dit_step_mask = [True, True, True, False, False, False, True, False, False, False, True, False, False, False, True, True]
+        #     elif num_dit_steps == 8:
+        #         self.dit_step_mask = [True, True, True, False, False, False, True, False, False, False, True, False, False, True, True, True]
+        #     else:
+        #         self.dit_step_mask = [True] * self.num_inference_steps
+        # else:
+        #     self.dit_step_mask = [True] * self.num_inference_steps
+
+        # assert len(self.dit_step_mask) == self.num_inference_steps, (
+        #     f"dit_step_mask length {len(self.dit_step_mask)} != num_inference_steps {self.num_inference_steps}"
+        # )
+        # assert self.dit_step_mask[0] is True, "first step must be True"
+
 
         self.normalize_video = v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
@@ -618,6 +752,17 @@ class WANPolicyHead(ActionHead):
         if actions.numel() > 0:
             assert actions.min() >= -1.0 and actions.max() <= 1.0, "actions must be in [-1,1] range"
         videos = data["images"]
+        if _should_debug_print("forward"):
+            # Forward-level 检查：这里是 loss 计算前模型实际收到的监督 action 和条件输入。
+            print("[DreamZeroDebug][action_head.forward]")
+            print(_summarize_tensor("  embodiment_id", embodiment_id))
+            print(_summarize_tensor("  has_real_action", has_real_action))
+            print(_summarize_tensor("  state", state_features))
+            print(_summarize_tensor("  action", actions))
+            print(_summarize_tensor("  action_mask", action_mask))
+            print(_summarize_tensor("  images_before_rearrange", videos))
+            print(_summarize_tensor("  text_ids", data.get("text")))
+            print(_summarize_tensor("  text_attention_mask", data.get("text_attention_mask")))
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
         print("videos", videos.shape)
@@ -792,7 +937,15 @@ class WANPolicyHead(ActionHead):
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
+                real_action_mask = has_real_action.reshape(
+                    -1, *([1] * (action_loss_per_sample.ndim - 1))
+                ).float()
+                if real_action_mask.shape[0] != action_loss_per_sample.shape[0]:
+                    raise ValueError(
+                        "has_real_action batch size does not match action loss batch size: "
+                        f"{tuple(has_real_action.shape)} vs {tuple(action_loss_per_sample.shape)}"
+                    )
+                action_loss_per_sample = real_action_mask * action_loss_per_sample
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
@@ -1039,7 +1192,11 @@ class WANPolicyHead(ActionHead):
         elif videos.shape[2] == 1:
             print("videos.shape[2] == 1, reset current_start_frame to 0")
             self.current_start_frame = 0
-        elif self.current_start_frame >= self.model.local_attn_size:
+        elif _should_reset_for_local_attention(
+            current_start_frame=self.current_start_frame,
+            local_attn_size=self.model.local_attn_size,
+            persistent_source_cache=getattr(self, "persistent_source_cache", False),
+        ):
             print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
             self.current_start_frame = 0
 
@@ -1137,11 +1294,17 @@ class WANPolicyHead(ActionHead):
         crossattn_caches = self._get_caches(
             [self.crossattn_cache, self.crossattn_cache_neg],
         )
+        debug_kv_cache = _should_debug_kv_cache_print()
 
         start_kv_event.record()
 
         if self.current_start_frame == 0:
             timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
+            if debug_kv_cache:
+                print(
+                    "[DreamZeroDebug][dreambase_kv_cache] "
+                    f"prefill first frame start=0, cache_tokens_before={_kv_cache_token_len(kv_caches)}"
+                )
             self._run_diffusion_steps(
                 noisy_input=image.transpose(1, 2),
                 timestep=timestep * 0,
@@ -1160,6 +1323,11 @@ class WANPolicyHead(ActionHead):
                     update_kv_cache=True,
                 ),
             )
+            if debug_kv_cache:
+                print(
+                    "[DreamZeroDebug][dreambase_kv_cache] "
+                    f"prefill first frame done, cache_tokens_after={_kv_cache_token_len(kv_caches)}"
+                )
             self.current_start_frame += 1
             
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
@@ -1170,6 +1338,12 @@ class WANPolicyHead(ActionHead):
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
             else:
                 y = self.ys[:, :, -self.num_frame_per_block:]
+            if debug_kv_cache:
+                print(
+                    "[DreamZeroDebug][dreambase_kv_cache] "
+                    f"update observed block start={self.current_start_frame - self.num_frame_per_block}, "
+                    f"frames={self.num_frame_per_block}, cache_tokens_before={_kv_cache_token_len(kv_caches)}"
+                )
             self._run_diffusion_steps(
                 noisy_input=current_ref_latents.transpose(1, 2),
                 timestep=timestep * 0,
@@ -1188,6 +1362,11 @@ class WANPolicyHead(ActionHead):
                     update_kv_cache=True,
                 ),
             )
+            if debug_kv_cache:
+                print(
+                    "[DreamZeroDebug][dreambase_kv_cache] "
+                    f"update observed block done, cache_tokens_after={_kv_cache_token_len(kv_caches)}"
+                )
 
         end_kv_event.record()
 
@@ -1221,6 +1400,27 @@ class WANPolicyHead(ActionHead):
             if self.ip_rank == 0:
                 print(f"Decoupled inference: video sigmas {sigma_max:.3f} -> {sample_scheduler.sigmas[-1].item():.3f}")
 
+        debug_inference = _should_debug_inference_print("inference.denoise")
+        debug_step_limit = _debug_inference_step_limit()
+        if debug_inference:
+            print("[DreamZeroDebug][inference.denoise]")
+            print(
+                f"  num_inference_steps={self.num_inference_steps}, "
+                f"dit_step_mask_len={len(self.dit_step_mask)}, "
+                f"dit_step_mask={self.dit_step_mask}"
+            )
+            print(
+                f"  NUM_DIT_STEPS={os.environ.get('NUM_DIT_STEPS', '<unset>')}, "
+                f"dynamic_cache_schedule={self.dynamic_cache_schedule}, "
+                f"seed={self.seed}, sigma_shift={self.sigma_shift}"
+            )
+            print(_summarize_tensor("  initial_noise_obs", noise_obs))
+            print(_summarize_tensor("  initial_noise_action", noise_action))
+            print(_summarize_tensor("  state_features", state_features))
+            gt_action = getattr(action_input, "action", None)
+            if torch.is_tensor(gt_action):
+                print(_summarize_tensor("  gt_action_if_available", gt_action))
+
         start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
         end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
         prev_predictions = [] 
@@ -1247,12 +1447,20 @@ class WANPolicyHead(ActionHead):
 
             # check if we need to run the DIT step
             should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
+            action_before_step = noisy_input_action if debug_inference and index < debug_step_limit else None
             if should_run_model:
                 dit_compute_steps += 1
                 if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
                     y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                 else:
                     y = self.ys[:, :, -self.num_frame_per_block:]
+                if debug_kv_cache and index == 0:
+                    print(
+                        "[DreamZeroDebug][dreambase_kv_cache] "
+                        f"denoise target start={self.current_start_frame}, "
+                        f"frames={self.num_frame_per_block}, "
+                        f"cache_tokens_used={_kv_cache_token_len(kv_caches)}, update_kv_cache=False"
+                    )
                 predictions = self._run_diffusion_steps(
                     noisy_input=noisy_input.transpose(1, 2),
                     timestep=timestep,
@@ -1279,10 +1487,11 @@ class WANPolicyHead(ActionHead):
                 max_cache_size = 2
                 if len(prev_predictions) > max_cache_size:
                     prev_predictions.pop(0)
+                reused_from_timestep = None
 
             else:
                 assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
-                _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
+                reused_from_timestep, flow_pred, flow_pred_cond_action = prev_predictions[-1]
 
             end_diffusion_events[index].record()
 
@@ -1304,9 +1513,40 @@ class WANPolicyHead(ActionHead):
                 return_dict=False,
             )[0]
 
+            if debug_inference and index < debug_step_limit:
+                action_delta = None
+                if action_before_step is not None:
+                    action_delta = (noisy_input_action - action_before_step).detach()
+                print(
+                    f"  step={index:02d}, video_t={int(video_timestep.item())}, "
+                    f"action_t={int(action_timestep.item())}, run_model={should_run_model}, "
+                    f"reused_from={None if should_run_model else int(reused_from_timestep.item())}"
+                )
+                print(_summarize_tensor("    flow_pred_action", flow_pred_cond_action))
+                print(_summarize_tensor("    action_after_step", noisy_input_action))
+                print(_summarize_tensor("    action_step_delta", action_delta))
+
         latents = noisy_input
         latents_action = noisy_input_action
         output = latents
+
+        if debug_inference:
+            print(f"  actual_dit_compute_steps={dit_compute_steps}/{len(sample_scheduler.timesteps)}")
+            print(_summarize_tensor("  final_action_pred_normalized", latents_action))
+            active_action_dim = _infer_active_action_dim(action_input, latents_action)
+            print(f"  active_action_dim={active_action_dim}/{latents_action.shape[-1]}")
+            print(_summarize_tensor("  final_action_pred_normalized_active", latents_action[..., :active_action_dim]))
+            if active_action_dim < latents_action.shape[-1]:
+                print(_summarize_tensor("  final_action_pred_normalized_padded", latents_action[..., active_action_dim:]))
+            gt_action = getattr(action_input, "action", None)
+            if torch.is_tensor(gt_action) and gt_action.shape == latents_action.shape:
+                inference_mse = torch.nn.functional.mse_loss(latents_action.float(), gt_action.float())
+                print(f"  normalized_action_mse_vs_gt={float(inference_mse.item()):.6f}")
+            elif torch.is_tensor(gt_action):
+                print(
+                    "  normalized_action_mse_vs_gt=skipped "
+                    f"(gt_shape={tuple(gt_action.shape)}, pred_shape={tuple(latents_action.shape)})"
+                )
 
         if self.current_start_frame == 1:
             output = torch.cat([image, output], dim=1)

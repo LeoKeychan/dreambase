@@ -1,5 +1,6 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import time
 
@@ -13,6 +14,167 @@ import yaml
 from groot.vla.common.utils import get_frames_by_timestamps
 
 from .lerobot import LE_ROBOT_EPISODE_FILENAME, LeRobotMixtureDataset, LeRobotSingleDataset
+
+
+_DEBUG_COUNTERS: dict[str, int] = {}
+
+
+def _debug_supervision_enabled() -> bool:
+    # 与 transform/action head 共用同一个开关，避免正常训练时产生额外 stdout 开销。
+    return os.environ.get("DREAMZERO_DEBUG_SUPERVISION", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_rank_enabled() -> bool:
+    # 多卡训练只让 local rank 0 打印，避免同一批信息被所有进程刷屏。
+    return os.environ.get("LOCAL_RANK", "0") in {"", "0"}
+
+
+def _debug_limit() -> int:
+    try:
+        return int(os.environ.get("DREAMZERO_DEBUG_SUPERVISION_LIMIT", "3"))
+    except ValueError:
+        return 3
+
+
+def _should_debug_print(section: str) -> bool:
+    # 每个 debug section 独立计数；默认只打印前几个样本用于快速排查对齐问题。
+    if not (_debug_supervision_enabled() and _debug_rank_enabled()):
+        return False
+    count = _DEBUG_COUNTERS.get(section, 0)
+    if count >= _debug_limit():
+        return False
+    _DEBUG_COUNTERS[section] = count + 1
+    return True
+
+
+def _summarize_array(name: str, value, max_values: int = 8) -> str:
+    # 打印 shape / dtype / 值域 / 前几个值，足够判断标签是否明显错位或归一化异常。
+    if value is None:
+        return f"{name}: None"
+    if torch.is_tensor(value):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+    if array.dtype.kind in {"U", "S", "O"}:
+        return f"{name}: shape={array.shape}, dtype={array.dtype}, value={repr(value)[:240]}"
+    flat = array.reshape(-1)
+    if flat.size == 0:
+        return f"{name}: shape={array.shape}, dtype={array.dtype}, empty"
+    preview = np.array2string(flat[:max_values], precision=4, separator=", ")
+    return (
+        f"{name}: shape={array.shape}, dtype={array.dtype}, "
+        f"min={float(np.nanmin(flat)):.4f}, max={float(np.nanmax(flat)):.4f}, first={preview}"
+    )
+
+
+def _shape_tuple(value) -> tuple[int, ...] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def _generic_shape_signature(sample: dict) -> tuple:
+    signature = ["generic"]
+    for key in sorted(sample.keys()):
+        shape = _shape_tuple(sample[key])
+        if shape is not None:
+            signature.append((key, shape))
+    return tuple(signature)
+
+
+def _robotwin_bucket_signature(sample: dict, min_chunks: int = 2) -> tuple | None:
+    images_shape = _shape_tuple(sample.get("images"))
+    target_images_shape = _shape_tuple(sample.get("target_images"))
+    state_shape = _shape_tuple(sample.get("state"))
+    action_shape = _shape_tuple(sample.get("action"))
+    if images_shape is None:
+        return _generic_shape_signature(sample)
+    if state_shape is None or action_shape is None or len(images_shape) < 1:
+        return None
+    if target_images_shape is not None and images_shape[0] != target_images_shape[0]:
+        return None
+
+    video_frames = images_shape[0]
+    if video_frames < 1 or (video_frames - 1) % 8 != 0:
+        return None
+    chunks = (video_frames - 1) // 8
+    if chunks < min_chunks:
+        return None
+    if len(state_shape) < 1 or len(action_shape) < 1:
+        return None
+    if state_shape[0] != chunks or action_shape[0] != 24 * chunks:
+        return None
+
+    signature = [
+        chunks,
+        images_shape,
+        state_shape,
+        action_shape,
+    ]
+    if target_images_shape is not None:
+        signature.append(target_images_shape)
+    return tuple(signature)
+
+
+class RoboTwinBucketedBatchDataset(IterableDataset):
+    def __init__(self, dataset: IterableDataset, batch_size: int, min_chunks: int = 2):
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if min_chunks < 1:
+            raise ValueError(f"min_chunks must be >= 1, got {min_chunks}")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.min_chunks = int(min_chunks)
+
+    def __iter__(self):
+        buckets: dict[tuple, list[dict]] = {}
+        for sample in self.dataset:
+            signature = _robotwin_bucket_signature(sample, min_chunks=self.min_chunks)
+            if signature is None:
+                if _should_debug_print("robotwin_bucket_drop"):
+                    print("[DreamZeroDebug][robotwin.bucket_drop]")
+                    print(f"  images_shape={_shape_tuple(sample.get('images'))}")
+                    print(f"  target_images_shape={_shape_tuple(sample.get('target_images'))}")
+                    print(f"  state_shape={_shape_tuple(sample.get('state'))}")
+                    print(f"  action_shape={_shape_tuple(sample.get('action'))}")
+                continue
+
+            bucket = buckets.setdefault(signature, [])
+            bucket.append(sample)
+            if len(bucket) == self.batch_size:
+                yield list(bucket)
+                bucket.clear()
+
+    def __len__(self) -> int:
+        try:
+            return len(self.dataset) // self.batch_size
+        except TypeError:
+            return 0
+
+
+def _debug_step_alignment(dataset, dataset_index: int, shard_index: int, trajectory_id: int, step_index: int, indices: dict, step_data: dict) -> None:
+    # 在 transform 之前打印原始样本，便于确认 video/state/action/prompt 是否来自同一条轨迹。
+    if not _should_debug_print("dataset_alignment"):
+        return
+
+    print("[DreamZeroDebug][dataset.alignment]")
+    print(
+        f"  dataset_index={dataset_index}, shard_index={shard_index}, "
+        f"trajectory_id={trajectory_id}, step_index={step_index}"
+    )
+    print(f"  dataset_path={getattr(dataset, 'dataset_path', None)}")
+    for key, value in indices.items():
+        print(_summarize_array(f"  indices[{key}]", value))
+
+    parquet_path = getattr(dataset, "all_parquet_paths", {}).get(trajectory_id)
+    print(f"  parquet_path={parquet_path}")
+    for video_key, paths in getattr(dataset, "all_video_paths", {}).get(trajectory_id, {}).items():
+        print(f"  video_path[{video_key}]={paths}")
+
+    for key in sorted(step_data.keys()):
+        if key.startswith(("video.", "state.", "action.", "annotation.")) or key in {"video", "state", "action"}:
+            print(_summarize_array(f"  step_data[{key}]", step_data.get(key)))
 
 
 class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
@@ -1518,6 +1680,16 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
                 step_data = dataset.get_step_data(trajectory_id, indices)
                 # Skip samples where state or action would be empty
                 if step_data is not None:
+                    # Dataset-level 对齐检查：这里的 step_data 还未做 resize、归一化和 prompt 封装。
+                    _debug_step_alignment(
+                        dataset,
+                        dataset_index,
+                        shard_index,
+                        trajectory_id,
+                        step_index,
+                        indices,
+                        step_data,
+                    )
                     yield dataset.transforms(step_data)
 
             # Delete the cached shard and shard start indices to free up memory

@@ -45,7 +45,10 @@ from transformers.trainer import (
 )
 
 import groot.vla.common.utils as U
-from groot.vla.data.dataset.lerobot_sharded import ShardedLeRobotMixtureDataset
+from groot.vla.data.dataset.lerobot_sharded import (
+    RoboTwinBucketedBatchDataset,
+    ShardedLeRobotMixtureDataset,
+)
 from groot.vla.data.schema import EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
 from groot.vla.experiment.utils import (
@@ -480,6 +483,17 @@ class BaseTrainer(transformers.Trainer):
         return self.optimizer
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
+        output_dir = output_dir or self.args.output_dir
+
+        if self.is_deepspeed_enabled and not self.base_cfg.save_lora_only:
+            assert self.deepspeed is not None, "DeepSpeed engine is required for sharded saving."
+            os.makedirs(output_dir, exist_ok=True)
+            self.deepspeed.save_checkpoint(output_dir)
+            if self.args.should_save:
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                assert hasattr(unwrapped_model, "config"), "Model must expose config for checkpoint metadata."
+                unwrapped_model.config.save_pretrained(output_dir)
+            return
 
         ## save tuned model separately
         if self.is_deepspeed_enabled:
@@ -569,8 +583,23 @@ class BaseTrainer(transformers.Trainer):
             data_collator, description="training"
         )
 
+        dataloader_batch_size = self._train_batch_size
+        base_cfg = getattr(self, "base_cfg", None)
+        if base_cfg is not None and bool(getattr(base_cfg, "robotwin_bucket_batching", False)):
+            min_chunks = int(getattr(base_cfg, "robotwin_bucket_min_chunks", 2))
+            train_dataset = RoboTwinBucketedBatchDataset(
+                train_dataset,
+                batch_size=self._train_batch_size,
+                min_chunks=min_chunks,
+            )
+            dataloader_batch_size = None
+            print(
+                "Using RoboTwin bucketed batching: "
+                f"batch_size={self._train_batch_size}, min_chunks={min_chunks}"
+            )
+
         dataloader_params = {
-            "batch_size": self._train_batch_size,
+            "batch_size": dataloader_batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
@@ -699,6 +728,7 @@ class BaseExperiment(ABC):
 
     def create_model(self, cfg, training_args):
         model = instantiate(cfg.model)
+        mprint(f"[CODE_CHECK] experiment/base.py loaded from current source, cfg.pretrained_model_path={cfg.pretrained_model_path}")
 
         if cfg.pretrained_model_path is not None:
             mprint(f"Loading pretrained weights from: {cfg.pretrained_model_path}")
@@ -869,6 +899,9 @@ class BaseExperiment(ABC):
         # Start training.
         self.trainer.train(resume_from_checkpoint=self.resume_from_checkpoint)
         self.trainer.save_state()
-        safe_save_model_for_hf_trainer(
-            trainer=self.trainer, output_dir=self.training_args.output_dir
-        )
+        if self.trainer.is_deepspeed_enabled and not self.cfg.save_lora_only:
+            self.trainer.save_model(self.training_args.output_dir, _internal_call=True)
+        else:
+            safe_save_model_for_hf_trainer(
+                trainer=self.trainer, output_dir=self.training_args.output_dir
+            )
