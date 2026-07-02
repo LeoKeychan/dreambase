@@ -57,7 +57,7 @@ bash scripts/data/convert_robotwin_threeview_tasks.sh
 ### 训练
 ```bash
 cd xxx/dreambase
-conda activate /meta_eon_cfs/home/szj/miniconda3/envs/dream
+conda activate dreamzero
 bash scripts/train/robotwin_threeview_baseline_training.sh
 ```
 
@@ -88,7 +88,7 @@ bash scripts/data/convert_robotwin_targetview_tasks.sh
 ### 训练
 ```bash
 cd xxx/dreamtriple
-conda activate /meta_eon_cfs/home/szj/miniconda3/envs/dream
+conda activate dreamzero
 bash scripts/train/robotwin_triple_target_training.sh
 ```
 
