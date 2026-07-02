@@ -50,6 +50,7 @@ hf download GEAR-Dreams/DreamZero-AgiBot --repo-type model --local-dir ./checkpo
 ### 数据处理
 ```bash
 cd xxx/dreambase
+conda activate dreamzero
 # 转换数据格式，补充生成 metadata
 bash scripts/data/convert_robotwin_threeview_tasks.sh
 ```
@@ -65,10 +66,12 @@ bash scripts/train/robotwin_threeview_baseline_training.sh
 ```bash
 # 开 server
 cd xxx/dreambase
+conda activate dreamzero
 bash eval_utils/server.sh
 
 # 连接 server
 cd xxx/RoboTwin/policy/DreamBase
+conda activate dreamtwin
 # eval.sh 顶部的命令参考 <DREAMBASE_SERVER_PORT> bash eval.sh <task_name> <task_config> <ckpt_setting> <checkpoint_num> <gpu_id>
 DREAMBASE_SERVER_PORT=8003 bash eval.sh dump_bin_bigbin demo_clean robotwin_baseline_16train 35000 3
 ```
@@ -78,10 +81,12 @@ DREAMBASE_SERVER_PORT=8003 bash eval.sh dump_bin_bigbin demo_clean robotwin_base
 ### 数据处理
 ```bash
 cd xxx/dreamtriple
+conda activate robotwin
 # scripts/data/render.sh 先根据注释修改路径，然后再渲染 target_front 视角
 bash scripts/data/render.sh
 # 如果出现某些渲染错误，执行 RETRY_ERRORS=1 scripts/data/render.sh
 # 转换数据格式，补充生成 metadata
+conda activate dreamzero
 bash scripts/data/convert_robotwin_targetview_tasks.sh
 ```
 
@@ -96,10 +101,12 @@ bash scripts/train/robotwin_triple_target_training.sh
 ```bash
 # 开 server
 cd xxx/dreamtriple
+conda activate dreamzero
 bash eval_utils/server.sh
 
 # 连接 server
 cd xxx/RoboTwin/policy/DreamTriple
+conda activate dreamtwin
 # eval.sh 顶部的命令参考 <DREAMBASE_SERVER_PORT> bash eval.sh <task_name> <task_config> <ckpt_setting> <checkpoint_num> <gpu_id>
 DREAMTRIPLE_SERVER_PORT=6010 bash eval.sh click_alarmclock demo_clean robotwin_target_16train 35000 4
 ```
